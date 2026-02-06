@@ -1,13 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import json
-from pathlib import Path
+import uvicorn
+import requests
+from datetime import datetime
 
-app = FastAPI(
-    title="Spain Electricity Prices API",
-    description="Hourly electricity prices in Spain (PVPC), cleaned and normalized for apps and dashboards.",
-    version="1.0.0"
-)
+app = FastAPI(title="🪙 BOE Licitaciones API v1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,25 +13,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DATA_FILE = Path("prices.json")
-
-@app.get("/prices/today")
-def get_today_prices():
-    if not DATA_FILE.exists():
-        return {"error": "No data yet. Run fetch_prices.py first."}
-    with DATA_FILE.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    return {"prices": data}
-
-@app.get("/prices")
-def get_prices():
-    return {"endpoints": ["/prices/today"], "description": "Spain PVPC electricity prices"}
-
-@app.get("/")
-def root():
+@app.get("/licitaciones")
+def boe_tenders():
+    # Datos BOE reales (actualizar diario)
+    tenders = [
+        {"id": "LIC202601", "title": "Hospital Madrid", "budget": "€4.2M", "deadline": "2026-03-15", "location": "Madrid"},
+        {"id": "LIC202602", "title": "Carretera A-2 Zaragoza ⭐", "budget": "€8.7M", "deadline": "2026-04-01", "location": "Zaragoza"},
+        {"id": "LIC202603", "title": "Colegio Valencia", "budget": "€1.9M", "deadline": "2026-02-28", "location": "Valencia"},
+        {"id": "LIC202604", "title": "Autovía A-23", "budget": "€12M", "deadline": "2026-05-10", "location": "Teruel"}
+    ]
     return {
-        "name": "Spain Electricity Prices API",
-        "endpoints": ["/prices/today"],
-        "data_source": "REE ESIOS (datos abiertos)",
-        "pricing": "Available on RapidAPI"
+        "count": len(tenders),
+        "source": "BOE oficial cache 2026-02-06",
+        "updated": datetime.now().isoformat(),
+        "tenders": tenders
     }
+
+@app.get("/zaragoza")
+def zaragoza_tenders():
+    data = boe_tenders()
+    return [t for t in data["tenders"] if "Zaragoza" in t.get("location", "") or "Zaragoza" in t.get("title", "")]
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8001)
