@@ -1,10 +1,16 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 import uvicorn
-import json
 from datetime import datetime
+from typing import Dict, List, Optional
+from statistics import mean
 
-app = FastAPI(title="🇪🇸 Spain Public Tenders & Energy API v2.1 PRO")
+app = FastAPI(
+    title="⚡ Spain Energy PVPC API PRO",
+    description="API real de precios PVPC España con datos actualizados de REE",
+    version="3.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -13,117 +19,176 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🔥 BOE NACIONAL - TOP licitaciones España
-@app.get("/licitaciones")
-def boe_nacional():
+# URL base de la API gratuita de precios (usa datos oficiales REE)
+BASE_URL = "https://api.preciodelaluz.org/v1/prices"
+
+async def fetch_pvpc_data(zone: str = "PCB") -> Dict:
+    """Obtiene datos reales de PVPC desde API gratuita"""
+    try:
+        url = f"{BASE_URL}/now?zone={zone}"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=503, detail=f"Error obteniendo datos REE: {str(e)}")
+
+def calculate_statistics(prices: List[float]) -> Dict:
+    """Calcula estadísticas de precios"""
+    if not prices:
+        return {"min": 0, "max": 0, "avg": 0}
     return {
-        "total_licitaciones": 45000,
-        "volumen_euros": "€45B",
-        "actualizado": datetime.now().isoformat(),
-        "top_5": [
-            {"ciudad": "Barcelona", "proyecto": "Metro L10", "budget": "€15M", "deadline": "2026-06-01"},
-            {"ciudad": "Zaragoza", "proyecto": "Carretera A-2 ⭐", "budget": "€8.7M", "deadline": "2026-04-01"},
-            {"ciudad": "Madrid", "proyecto": "Hospital", "budget": "€4.2M", "deadline": "2026-03-15"},
-            {"ciudad": "Sevilla", "proyecto": "Tranvía", "budget": "€22M", "deadline": "2026-05-20"},
-            {"ciudad": "Valencia", "proyecto": "Colegio", "budget": "€1.9M", "deadline": "2026-02-28"}
+        "min": round(min(prices), 4),
+        "max": round(max(prices), 4),
+        "avg": round(mean(prices), 4)
+    }
+
+@app.get("/")
+def root():
+    """Endpoint raíz con información de la API"""
+    return {
+        "api": "⚡ Spain Energy PVPC API PRO",
+        "version": "3.0.0",
+        "status": "✅ LIVE",
+        "data_source": "REE oficial vía preciodelaluz.org",
+        "endpoints": [
+            "/now - Precio actual PVPC",
+            "/today - Precios completos hoy",
+            "/forecast - Predicción próximas 6h",
+            "/stats - Estadísticas diarias",
+            "/cheapest - 5 horas más baratas hoy"
         ],
-        "ciudades_disponibles": ["madrid","barcelona","valencia","zaragoza","sevilla","malaga","murcia","palma","alicante","bilbao"]
+        "zones": ["PCB (Península/Canarias/Baleares)", "CYM (Ceuta y Melilla)"],
+        "docs": "/docs"
     }
 
-# 🏙️ LICITACIONES POR CIUDAD (15 principales España)
-@app.get("/ciudades/{ciudad}")
-def ciudad_licitaciones(ciudad: str):
-    ciudades_data = {
-        "madrid": {"licitaciones": 928, "volumen": "€928M", "top": "Hospital €4.2M", "luz": "0.145 €/kWh"},
-        "barcelona": {"licitaciones": 13000, "volumen": "€13B", "top": "Metro L10 €15M", "luz": "0.142 €/kWh"},
-        "valencia": {"licitaciones": 3475, "volumen": "€3.5B", "top": "Colegio €1.9M", "luz": "0.148 €/kWh"},
-        "sevilla": {"licitaciones": 6253, "volumen": "€6.3B", "top": "Tranvía €22M", "luz": "0.151 €/kWh"},
-        "zaragoza": {"licitaciones": 1060, "volumen": "€1.1B", "top": "Carretera A-2 €8.7M ⭐", "luz": "0.145 €/kWh"},
-        "malaga": {"licitaciones": 1407, "volumen": "€1.4B", "top": "Puerto €12M", "luz": "0.149 €/kWh"},
-        "murcia": {"licitaciones": 3000, "volumen": "€3B", "top": "Riego €5M", "luz": "0.147 €/kWh"},
-        "palma": {"licitaciones": 1442, "volumen": "€1.4B", "top": "Turismo €9M", "luz": "0.152 €/kWh"},
-        "laspalmas": {"licitaciones": 1442, "volumen": "€1.4B", "top": "Aeropuerto €7M", "luz": "0.150 €/kWh"},
-        "alicante": {"licitaciones": 3475, "volumen": "€3.5B", "top": "Playa €3M", "luz": "0.146 €/kWh"},
-        "bilbao": {"licitaciones": 2730, "volumen": "€2.7B", "top": "Puerto €11M", "luz": "0.144 €/kWh"},
-        "cordoba": {"licitaciones": 1407, "volumen": "€1.4B", "top": "Puente €2.8M", "luz": "0.150 €/kWh"},
-        "valladolid": {"licitaciones": 1118, "volumen": "€1.1B", "top": "Hospital €6M", "luz": "0.143 €/kWh"},
-        "vigo": {"licitaciones": 2075, "volumen": "€2.1B", "top": "Puerto €14M", "luz": "0.148 €/kWh"},
-        "gijon": {"licitaciones": 1060, "volumen": "€1B", "top": "Renovables €4M", "luz": "0.141 €/kWh"}
-    }
+@app.get("/now")
+async def get_current_price(zone: str = "PCB"):
+    """Obtiene el precio actual de la luz en tiempo real"""
+    data = await fetch_pvpc_data(zone)
     
-    data = ciudades_data.get(ciudad.lower())
-    if data:
-        return {
-            "ciudad": ciudad.title(),
-            "licitaciones_2026": data["licitaciones"],
-            "volumen_anual": data["volumen"],
-            "proyecto_destacado": data["top"],
-            "precio_luz_pvpc": data["luz"],
-            "oportunidad": "Alta demanda constructoras/consultoras",
-            "source": "BOE + Plataforma Contratación"
-        }
     return {
-        "error": f"{ciudad} no en top 15",
-        "usa": "madrid/barcelona/valencia/sevilla/zaragoza/malaga/etc",
-        "top_ciudades": list(ciudades_data.keys())
+        "timestamp": datetime.now().isoformat(),
+        "zone": zone,
+        "current_price_kwh": data.get("price", "N/A"),
+        "unit": "€/kWh",
+        "hour": data.get("hour", "N/A"),
+        "is_cheap": data.get("is-cheap", False),
+        "is_under_avg": data.get("is-under-avg", False),
+        "market": data.get("market", "N/A"),
+        "source": "REE oficial"
     }
 
-# 🤖 IA ANÁLISIS por ciudad
-@app.get("/ai/{ciudad}")
-def ai_analisis(ciudad: str):
-    analisis_ia = {
-        "zaragoza": {"prob": 85, "comp": 12, "margen": 24, "accion": "Preparar propuesta A-2 antes marzo"},
-        "madrid": {"prob": 72, "comp": 28, "margen": 18, "accion": "Hospital nicho especializado"},
-        "barcelona": {"prob": 91, "comp": 8, "margen": 28, "accion": "Metro infraestructura crítica"},
-        "valencia": {"prob": 78, "comp": 15, "margen": 22, "accion": "Educación ejecución rápida"},
-        "sevilla": {"prob": 82, "comp": 11, "margen": 25, "accion": "Tranvía movilidad sostenible"}
-    }
-    
-    ai = analisis_ia.get(ciudad.lower())
-    if ai:
-        ciudad_data = ciudad_licitaciones(ciudad)
-        volumen_num = float(ciudad_data["volumen_anual"][1:-1].replace('.',''))
-        margen_calc = volumen_num * ai["margen"] / 100
+@app.get("/today")
+async def get_today_prices(zone: str = "PCB"):
+    """Obtiene todos los precios del día de hoy"""
+    try:
+        url = f"https://api.preciodelaluz.org/v1/prices/all?zone={zone}"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+        
+        # Extraer precios por hora
+        hourly_prices = []
+        for hour, info in data.items():
+            if hour not in ["date", "units"]:
+                try:
+                    hourly_prices.append({
+                        "hour": hour,
+                        "price": float(info.get("price", 0)) / 1000,  # Convertir a €/kWh
+                        "is_cheap": info.get("is-cheap", False),
+                        "is_under_avg": info.get("is-under-avg", False)
+                    })
+                except (ValueError, TypeError):
+                    continue
+        
+        prices = [h["price"] for h in hourly_prices]
+        stats = calculate_statistics(prices)
         
         return {
-            "ciudad": ciudad.title(),
-            "proyecto": ciudad_data["proyecto_destacado"],
-            "ai_probabilidad_exito": f"{ai['prob']}%",
-            "competencia_estimada": f"{ai['comp']} ofertas",
-            "margen_potencial": f"€{margen_calc:.1f}M ({ai['margen']}%)",
-            "recomendacion_ia": ai["accion"],
-            "urgencia": "🔴 Alta" if ai['prob'] > 80 else "🟡 Media",
-            "precio_luz": ciudad_data["precio_luz_pvpc"]
-        }
-    return {"error": f"IA {ciudad} → usa zaragoza/madrid/barcelona/valencia/sevilla"}
-
-# 📊 Dashboard Constructoras
-@app.get("/dashboard")
-def dashboard_constructor():
-    return {
-        "oportunidad_top": "🏆 Zaragoza Carretera A-2 €8.7M (85% éxito)",
-        "mercado_total": "€45B España 2026",
-        "ciudades_calientes": ["Barcelona (91%)", "Zaragoza (85%)", "Sevilla (82%)"],
-        "alertas_urgentes": [
-            "Madrid Hospital deadline 2026-03-15 (20 días)",
-            "Barcelona Metro L10 alta prioridad infraestructura"
-        ],
-        "luz_promedio": "0.145 €/kWh PVPC",
-        "licitaciones_activas": 45000
-    }
-
-# 💡 Precios Luz Nacional
-@app.get("/precios")
-def precios_luz():
-    try:
-        with open("prices.json", "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {
-            "nacional": {"pvpc": "0.145 €/kWh", "actualizado": "2026-02-07"},
-            "regulada": True,
+            "date": data.get("date", datetime.now().strftime("%Y-%m-%d")),
+            "zone": zone,
+            "hourly_prices": sorted(hourly_prices, key=lambda x: x["hour"]),
+            "statistics": stats,
+            "total_hours": len(hourly_prices),
             "source": "REE oficial"
         }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Error: {str(e)}")
+
+@app.get("/forecast")
+async def get_forecast(zone: str = "PCB"):
+    """Predicción simple próximas 6 horas basada en media móvil"""
+    today_data = await get_today_prices(zone)
+    prices = [h["price"] for h in today_data["hourly_prices"]]
+    
+    current_hour = datetime.now().hour
+    
+    # Predicción naive: promedio últimas 6 horas
+    if len(prices) >= 6:
+        recent_avg = round(mean(prices[-6:]), 4)
+    else:
+        recent_avg = round(mean(prices), 4)
+    
+    forecast = []
+    for i in range(1, 7):
+        forecast_hour = (current_hour + i) % 24
+        forecast.append({
+            "hour": f"{forecast_hour:02d}:00-{forecast_hour+1:02d}:00",
+            "predicted_price": recent_avg,
+            "confidence": "low",
+            "note": "Predicción basada en media móvil 6h"
+        })
+    
+    return {
+        "zone": zone,
+        "forecast_from": datetime.now().isoformat(),
+        "method": "Moving average 6h",
+        "predictions": forecast,
+        "disclaimer": "Predicción simple, no garantizada"
+    }
+
+@app.get("/stats")
+async def get_statistics(zone: str = "PCB"):
+    """Estadísticas completas del día"""
+    today = await get_today_prices(zone)
+    
+    hourly = today["hourly_prices"]
+    prices = [h["price"] for h in hourly]
+    
+    cheap_hours = [h for h in hourly if h["is_cheap"]]
+    expensive_hours = sorted(hourly, key=lambda x: x["price"], reverse=True)[:5]
+    
+    return {
+        "date": today["date"],
+        "zone": zone,
+        "statistics": today["statistics"],
+        "cheap_hours_count": len(cheap_hours),
+        "top_5_expensive": expensive_hours,
+        "recommendation": "Consume entre 00h-08h para ahorrar" if cheap_hours else "Precios elevados hoy",
+        "avg_price_comparison": {
+            "today": today["statistics"]["avg"],
+            "threshold_cheap": 0.10,
+            "threshold_expensive": 0.15
+        }
+    }
+
+@app.get("/cheapest")
+async def get_cheapest_hours(zone: str = "PCB", limit: int = 5):
+    """Obtiene las N horas más baratas del día"""
+    today = await get_today_prices(zone)
+    
+    sorted_hours = sorted(today["hourly_prices"], key=lambda x: x["price"])
+    cheapest = sorted_hours[:limit]
+    
+    return {
+        "date": today["date"],
+        "zone": zone,
+        "cheapest_hours": cheapest,
+        "recommendation": f"Programa consumos intensivos en: {', '.join([h['hour'] for h in cheapest])}",
+        "potential_savings": f"{round((today['statistics']['max'] - today['statistics']['min']) * 100, 2)}% vs hora más cara"
+    }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
