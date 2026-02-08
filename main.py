@@ -1,15 +1,14 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
-import uvicorn
-from datetime import datetime
-from typing import Dict, List, Optional
+from datetime import datetime, date
 from statistics import mean
+import uvicorn
+import pvpc  # librería wrapper de ESIOS
 
 app = FastAPI(
-    title="⚡ Spain Energy PVPC API PRO",
-    description="API real de precios PVPC España con datos actualizados de REE",
-    version="3.0.0"
+    title="⚡ Spain PVPC Energy API (ESIOS)",
+    description="Precios PVPC reales por hora (€/kWh) para España usando el API de REE (ESIOS) vía librería pvpc",
+    version="1.0.0",
 )
 
 app.add_middleware(
@@ -19,176 +18,187 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# URL base de la API gratuita de precios (usa datos oficiales REE)
-BASE_URL = "https://api.preciodelaluz.org/v1/prices"
-
-async def fetch_pvpc_data(zone: str = "PCB") -> Dict:
-    """Obtiene datos reales de PVPC desde API gratuita"""
+def _get_zone_hours(day: date, zone: str):
+    """
+    Devuelve (fecha, lista de horas [{hour, price}], stats) para la zona dada.
+    zone: 'pcb' (Península/Canarias/Baleares) o 'cm' (Ceuta/Melilla)
+    """
     try:
-        url = f"{BASE_URL}/now?zone={zone}"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return response.json()
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=503, detail=f"Error obteniendo datos REE: {str(e)}")
+        r = pvpc.get_pvpc_day(day)
+    except pvpc.PVPCNoDataForDay:
+        raise HTTPException(
+            status_code=503,
+            detail="Aún no hay datos PVPC publicados para este día en ESIOS",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Error PVPC: {repr(e)}")
 
-def calculate_statistics(prices: List[float]) -> Dict:
-    """Calcula estadísticas de precios"""
-    if not prices:
-        return {"min": 0, "max": 0, "avg": 0}
-    return {
-        "min": round(min(prices), 4),
-        "max": round(max(prices), 4),
-        "avg": round(mean(prices), 4)
+    z = zone.lower()
+    if z == "pcb":
+        hours_dict = r.data.pcb.hours
+        zone_name = "PCB"
+    elif z in ("cm", "cym"):
+        hours_dict = r.data.cm.hours
+        zone_name = "CM"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Parámetro 'zone' debe ser 'pcb' o 'cm'",
+        )
+
+    hourly = []
+    for h_str, price in hours_dict.items():
+        h = int(h_str)
+        hourly.append(
+            {
+                "hour": f"{h:02d}:00-{(h+1)%24:02d}:00",
+                "price": float(price),  # €/kWh directamente
+            }
+        )
+    hourly_sorted = sorted(hourly, key=lambda x: x["hour"])
+    prices = [h["price"] for h in hourly_sorted]
+    stats = {
+        "min": round(min(prices), 5),
+        "max": round(max(prices), 5),
+        "avg": round(mean(prices), 5),
     }
+
+    return r.day, zone_name, hourly_sorted, stats
 
 @app.get("/")
 def root():
-    """Endpoint raíz con información de la API"""
     return {
-        "api": "⚡ Spain Energy PVPC API PRO",
-        "version": "3.0.0",
+        "api": "⚡ Spain PVPC Energy API (ESIOS)",
+        "version": "1.0.0",
         "status": "✅ LIVE",
-        "data_source": "REE oficial vía preciodelaluz.org",
+        "source": "ESIOS (REE) vía librería pvpc",
         "endpoints": [
-            "/now - Precio actual PVPC",
-            "/today - Precios completos hoy",
-            "/forecast - Predicción próximas 6h",
-            "/stats - Estadísticas diarias",
-            "/cheapest - 5 horas más baratas hoy"
+            "/now - Precio actual",
+            "/today - Precios de hoy",
+            "/stats - Estadísticas del día",
+            "/cheapest - Horas más baratas de hoy",
+            "/forecast - Predicción simple 6h (media móvil)",
         ],
-        "zones": ["PCB (Península/Canarias/Baleares)", "CYM (Ceuta y Melilla)"],
-        "docs": "/docs"
-    }
-
-@app.get("/now")
-async def get_current_price(zone: str = "PCB"):
-    """Obtiene el precio actual de la luz en tiempo real"""
-    data = await fetch_pvpc_data(zone)
-    
-    return {
-        "timestamp": datetime.now().isoformat(),
-        "zone": zone,
-        "current_price_kwh": data.get("price", "N/A"),
-        "unit": "€/kWh",
-        "hour": data.get("hour", "N/A"),
-        "is_cheap": data.get("is-cheap", False),
-        "is_under_avg": data.get("is-under-avg", False),
-        "market": data.get("market", "N/A"),
-        "source": "REE oficial"
+        "zones": ["pcb (Península/Canarias/Baleares)", "cm (Ceuta/Melilla)"],
+        "docs": "/docs",
     }
 
 @app.get("/today")
-async def get_today_prices(zone: str = "PCB"):
-    """Obtiene todos los precios del día de hoy"""
-    try:
-        url = f"https://api.preciodelaluz.org/v1/prices/all?zone={zone}"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            data = response.json()
-        
-        # Extraer precios por hora
-        hourly_prices = []
-        for hour, info in data.items():
-            if hour not in ["date", "units"]:
-                try:
-                    hourly_prices.append({
-                        "hour": hour,
-                        "price": float(info.get("price", 0)) / 1000,  # Convertir a €/kWh
-                        "is_cheap": info.get("is-cheap", False),
-                        "is_under_avg": info.get("is-under-avg", False)
-                    })
-                except (ValueError, TypeError):
-                    continue
-        
-        prices = [h["price"] for h in hourly_prices]
-        stats = calculate_statistics(prices)
-        
-        return {
-            "date": data.get("date", datetime.now().strftime("%Y-%m-%d")),
-            "zone": zone,
-            "hourly_prices": sorted(hourly_prices, key=lambda x: x["hour"]),
-            "statistics": stats,
-            "total_hours": len(hourly_prices),
-            "source": "REE oficial"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Error: {str(e)}")
+def today(zone: str = "pcb"):
+    """Todos los precios del día actual (24h) + estadísticas"""
+    today_date = date.today()
+    day, zone_name, hourly, stats = _get_zone_hours(today_date, zone)
 
-@app.get("/forecast")
-async def get_forecast(zone: str = "PCB"):
-    """Predicción simple próximas 6 horas basada en media móvil"""
-    today_data = await get_today_prices(zone)
-    prices = [h["price"] for h in today_data["hourly_prices"]]
-    
-    current_hour = datetime.now().hour
-    
-    # Predicción naive: promedio últimas 6 horas
-    if len(prices) >= 6:
-        recent_avg = round(mean(prices[-6:]), 4)
-    else:
-        recent_avg = round(mean(prices), 4)
-    
-    forecast = []
-    for i in range(1, 7):
-        forecast_hour = (current_hour + i) % 24
-        forecast.append({
-            "hour": f"{forecast_hour:02d}:00-{forecast_hour+1:02d}:00",
-            "predicted_price": recent_avg,
-            "confidence": "low",
-            "note": "Predicción basada en media móvil 6h"
-        })
-    
     return {
-        "zone": zone,
-        "forecast_from": datetime.now().isoformat(),
-        "method": "Moving average 6h",
-        "predictions": forecast,
-        "disclaimer": "Predicción simple, no garantizada"
+        "date": day.isoformat(),
+        "zone": zone_name,
+        "hourly_prices": hourly,
+        "statistics": stats,
+        "total_hours": len(hourly),
+        "source": "ESIOS (REE) vía pvpc",
+    }
+
+@app.get("/now")
+def now(zone: str = "pcb"):
+    """Precio actual (hora en curso) + flags de barato/caro respecto al día"""
+    today_date = date.today()
+    day, zone_name, hourly, stats = _get_zone_hours(today_date, zone)
+    current_hour = datetime.now().hour
+    current_range = f"{current_hour:02d}:00-{(current_hour+1)%24:02d}:00"
+
+    current_entry = next(
+        (h for h in hourly if h["hour"].startswith(f"{current_hour:02d}:")), None
+    )
+    if not current_entry:
+        raise HTTPException(status_code=404, detail="No hay dato para esta hora")
+
+    price = current_entry["price"]
+    is_cheap = price <= stats["avg"]
+    is_lowest = price == stats["min"]
+    is_highest = price == stats["max"]
+
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "date": day.isoformat(),
+        "zone": zone_name,
+        "hour_range": current_range,
+        "price_kwh": price,
+        "unit": "€/kWh",
+        "is_cheap_vs_avg": is_cheap,
+        "is_lowest_day": is_lowest,
+        "is_highest_day": is_highest,
+        "avg_price_day": stats["avg"],
+        "source": "ESIOS (REE) vía pvpc",
     }
 
 @app.get("/stats")
-async def get_statistics(zone: str = "PCB"):
-    """Estadísticas completas del día"""
-    today = await get_today_prices(zone)
-    
-    hourly = today["hourly_prices"]
-    prices = [h["price"] for h in hourly]
-    
-    cheap_hours = [h for h in hourly if h["is_cheap"]]
-    expensive_hours = sorted(hourly, key=lambda x: x["price"], reverse=True)[:5]
-    
+def stats(zone: str = "pcb"):
+    """Estadísticas completas del día actual"""
+    today_date = date.today()
+    day, zone_name, hourly, stats = _get_zone_hours(today_date, zone)
+    sorted_hours = sorted(hourly, key=lambda x: x["price"])
+    cheapest = sorted_hours[:5]
+    expensive = sorted_hours[-5:][::-1]
+
     return {
-        "date": today["date"],
-        "zone": zone,
-        "statistics": today["statistics"],
-        "cheap_hours_count": len(cheap_hours),
-        "top_5_expensive": expensive_hours,
-        "recommendation": "Consume entre 00h-08h para ahorrar" if cheap_hours else "Precios elevados hoy",
-        "avg_price_comparison": {
-            "today": today["statistics"]["avg"],
-            "threshold_cheap": 0.10,
-            "threshold_expensive": 0.15
-        }
+        "date": day.isoformat(),
+        "zone": zone_name,
+        "statistics": stats,
+        "cheapest_hours": cheapest,
+        "most_expensive_hours": expensive,
+        "recommendation": "Programa consumos intensivos en las horas más baratas",
     }
 
 @app.get("/cheapest")
-async def get_cheapest_hours(zone: str = "PCB", limit: int = 5):
-    """Obtiene las N horas más baratas del día"""
-    today = await get_today_prices(zone)
-    
-    sorted_hours = sorted(today["hourly_prices"], key=lambda x: x["price"])
-    cheapest = sorted_hours[:limit]
-    
+def cheapest(limit: int = 5, zone: str = "pcb"):
+    """N horas más baratas de hoy"""
+    if limit <= 0 or limit > 24:
+        raise HTTPException(status_code=400, detail="limit debe estar entre 1 y 24")
+
+    today_date = date.today()
+    day, zone_name, hourly, stats = _get_zone_hours(today_date, zone)
+    sorted_hours = sorted(hourly, key=lambda x: x["price"])
+    cheapest_hours = sorted_hours[:limit]
+
     return {
-        "date": today["date"],
-        "zone": zone,
-        "cheapest_hours": cheapest,
-        "recommendation": f"Programa consumos intensivos en: {', '.join([h['hour'] for h in cheapest])}",
-        "potential_savings": f"{round((today['statistics']['max'] - today['statistics']['min']) * 100, 2)}% vs hora más cara"
+        "date": day.isoformat(),
+        "zone": zone_name,
+        "cheapest_hours": cheapest_hours,
+        "avg_price_day": stats["avg"],
+    }
+
+@app.get("/forecast")
+def forecast(zone: str = "pcb"):
+    """Predicción naive próximas 6h usando media de las últimas 6 horas disponibles"""
+    today_date = date.today()
+    day, zone_name, hourly, stats = _get_zone_hours(today_date, zone)
+    prices = [h["price"] for h in hourly]
+    if len(prices) >= 6:
+        base = round(mean(prices[-6:]), 5)
+    else:
+        base = stats["avg"]
+
+    current_hour = datetime.now().hour
+    predictions = []
+    for i in range(1, 7):
+        h = (current_hour + i) % 24
+        predictions.append(
+            {
+                "hour": f"{h:02d}:00-{(h+1)%24:02d}:00",
+                "predicted_price": base,
+                "unit": "€/kWh",
+                "method": "6h moving average",
+            }
+        )
+
+    return {
+        "date": day.isoformat(),
+        "zone": zone_name,
+        "from_hour": current_hour,
+        "predictions": predictions,
+        "note": "Predicción simple basada en media móvil, sin garantías",
     }
 
 if __name__ == "__main__":
+    # Para pruebas locales
     uvicorn.run(app, host="0.0.0.0", port=8000)
