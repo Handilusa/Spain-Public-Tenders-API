@@ -2,14 +2,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import uvicorn
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from statistics import mean
 from typing import Dict, List
 
 app = FastAPI(
-    title="⚡ Spain Energy PVPC API (ESIOS Direct)",
-    description="API real de precios PVPC España directamente de ESIOS REE",
-    version="4.0.0"
+    title="⚡ Spain Energy PVPC API",
+    description="API real de precios PVPC España con datos REE",
+    version="5.0.0"
 )
 
 app.add_middleware(
@@ -19,51 +19,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Indicadores ESIOS: 1001 (PCB), 1002 (Ceuta/Melilla)
-ESIOS_BASE = "https://api.esios.ree.es/indicators"
-INDICATOR_PCB = 1001
-INDICATOR_CM = 1002
-
-def fetch_esios_pvpc(day: date, zone: str) -> Dict:
-    """Obtiene precios PVPC de ESIOS REE para un día y zona"""
-    indicator = INDICATOR_PCB if zone.lower() == "pcb" else INDICATOR_CM
+def fetch_pvpc_today(zone: str) -> Dict:
+    """Obtiene precios PVPC del día desde endpoint público REE"""
+    # API pública de REE (archives) - sin token necesario
+    today_str = date.today().strftime("%Y-%m-%d")
     
-    start_date = day.strftime("%Y-%m-%dT00:00:00")
-    end_date = (day + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
-    
-    url = f"{ESIOS_BASE}/{indicator}"
-    params = {
-        "start_date": start_date,
-        "end_date": end_date
-    }
+    # URLs públicas de archivos JSON de REE
+    # PCB: Península/Canarias/Baleares, CYM: Ceuta/Melilla
+    if zone.lower() == "pcb":
+        url = f"https://api.esios.ree.es/archives/70/download_json?locale=es&date={today_str}"
+    else:  # cm / cym
+        url = f"https://api.esios.ree.es/archives/71/download_json?locale=es&date={today_str}"
     
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(url, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         
         hourly = {}
-        for entry in data.get("indicator", {}).get("values", []):
-            dt = datetime.fromisoformat(entry["datetime"].replace("Z", "+00:00"))
-            hour = dt.hour
-            price_mwh = float(entry["value"])
+        for entry in data.get("PVPC", []):
+            hour_str = entry.get("Hora", "")
+            if not hour_str or "-" not in hour_str:
+                continue
+            
+            hour = int(hour_str.split("-")[0]) - 1  # "01-02" → hora 0
+            price_str = entry.get("PCB" if zone.lower() == "pcb" else "CYM", "0")
+            
+            # Formato: "123,45" → 123.45 (€/MWh) → 0.12345 (€/kWh)
+            price_mwh = float(price_str.replace(",", "."))
             price_kwh = round(price_mwh / 1000, 5)
             hourly[hour] = price_kwh
         
         if not hourly:
-            raise HTTPException(503, detail="No hay datos PVPC disponibles para este día")
+            raise HTTPException(503, detail="No hay datos PVPC disponibles para hoy")
         
         return {
-            "date": day,
+            "date": date.today(),
             "zone": zone.upper(),
             "hourly": hourly
         }
     
     except requests.RequestException as e:
-        raise HTTPException(503, detail=f"Error conectando con ESIOS: {str(e)}")
+        raise HTTPException(503, detail=f"Error obteniendo datos REE: {str(e)}")
 
 def calculate_stats(prices: List[float]) -> Dict:
-    """Calcula estadísticas de lista de precios"""
     if not prices:
         return {"min": 0, "max": 0, "avg": 0}
     return {
@@ -74,17 +73,16 @@ def calculate_stats(prices: List[float]) -> Dict:
 
 @app.get("/")
 def root():
-    """Endpoint raíz con información de la API"""
     return {
-        "api": "⚡ Spain Energy PVPC API (ESIOS Direct)",
-        "version": "4.0.0",
+        "api": "⚡ Spain Energy PVPC API",
+        "version": "5.0.0",
         "status": "✅ LIVE",
-        "data_source": "ESIOS REE directo (sin intermediarios)",
+        "data_source": "REE archives (público, sin token)",
         "endpoints": [
             "/now?zone=pcb - Precio actual",
-            "/today?zone=pcb - Precios 24h hoy",
+            "/today?zone=pcb - Precios 24h",
             "/forecast?zone=pcb - Predicción 6h",
-            "/stats?zone=pcb - Estadísticas día",
+            "/stats?zone=pcb - Estadísticas",
             "/cheapest?zone=pcb&limit=5 - Horas baratas"
         ],
         "zones": ["pcb (Península/Canarias/Baleares)", "cm (Ceuta/Melilla)"],
@@ -93,10 +91,7 @@ def root():
 
 @app.get("/now")
 def get_current_price(zone: str = "pcb"):
-    """Precio actual de la luz en tiempo real"""
-    today = date.today()
-    data = fetch_esios_pvpc(today, zone)
-    
+    data = fetch_pvpc_today(zone)
     current_hour = datetime.now().hour
     hourly = data["hourly"]
     
@@ -118,24 +113,18 @@ def get_current_price(zone: str = "pcb"):
         "is_lowest": current_price == stats["min"],
         "is_highest": current_price == stats["max"],
         "avg_day": stats["avg"],
-        "source": "ESIOS REE directo"
+        "source": "REE archives"
     }
 
 @app.get("/today")
 def get_today_prices(zone: str = "pcb"):
-    """Obtiene todos los precios del día de hoy"""
-    today = date.today()
-    data = fetch_esios_pvpc(today, zone)
-    
+    data = fetch_pvpc_today(zone)
     hourly = data["hourly"]
     prices = list(hourly.values())
     stats = calculate_stats(prices)
     
     hourly_list = [
-        {
-            "hour": f"{h:02d}:00-{(h+1)%24:02d}:00",
-            "price": hourly[h]
-        }
+        {"hour": f"{h:02d}:00-{(h+1)%24:02d}:00", "price": hourly[h]}
         for h in sorted(hourly.keys())
     ]
     
@@ -145,63 +134,51 @@ def get_today_prices(zone: str = "pcb"):
         "hourly_prices": hourly_list,
         "statistics": stats,
         "total_hours": len(hourly_list),
-        "source": "ESIOS REE directo"
+        "source": "REE archives"
     }
 
 @app.get("/forecast")
 def get_forecast(zone: str = "pcb"):
-    """Predicción simple próximas 6 horas basada en media móvil"""
     today_data = get_today_prices(zone)
     prices = [h["price"] for h in today_data["hourly_prices"]]
-    
     current_hour = datetime.now().hour
     
-    if len(prices) >= 6:
-        recent_avg = round(mean(prices[-6:]), 5)
-    else:
-        recent_avg = round(mean(prices), 5)
+    recent_avg = round(mean(prices[-6:]) if len(prices) >= 6 else mean(prices), 5)
     
-    forecast = []
-    for i in range(1, 7):
-        forecast_hour = (current_hour + i) % 24
-        forecast.append({
-            "hour": f"{forecast_hour:02d}:00-{(forecast_hour+1)%24:02d}:00",
+    forecast = [
+        {
+            "hour": f"{(current_hour+i)%24:02d}:00-{(current_hour+i+1)%24:02d}:00",
             "predicted_price": recent_avg,
             "confidence": "low",
-            "note": "Predicción basada en media móvil 6h"
-        })
+            "note": "Media móvil 6h"
+        }
+        for i in range(1, 7)
+    ]
     
     return {
         "zone": zone,
         "forecast_from": datetime.now().isoformat(),
         "method": "Moving average 6h",
-        "predictions": forecast,
-        "disclaimer": "Predicción simple, no garantizada"
+        "predictions": forecast
     }
 
 @app.get("/stats")
 def get_statistics(zone: str = "pcb"):
-    """Estadísticas completas del día actual"""
     today_data = get_today_prices(zone)
-    
     hourly = today_data["hourly_prices"]
     sorted_hours = sorted(hourly, key=lambda x: x["price"])
-    
-    cheapest_5 = sorted_hours[:5]
-    expensive_5 = sorted_hours[-5:][::-1]
     
     return {
         "date": today_data["date"],
         "zone": today_data["zone"],
         "statistics": today_data["statistics"],
-        "cheapest_hours": cheapest_5,
-        "most_expensive_hours": expensive_5,
+        "cheapest_hours": sorted_hours[:5],
+        "most_expensive_hours": sorted_hours[-5:][::-1],
         "recommendation": "Programa consumos en horas baratas"
     }
 
 @app.get("/cheapest")
 def get_cheapest_hours(zone: str = "pcb", limit: int = 5):
-    """N horas más baratas del día para programar consumos"""
     if limit < 1 or limit > 24:
         raise HTTPException(400, detail="limit debe estar entre 1 y 24")
     
