@@ -19,28 +19,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# URL base de la API gratuita de precios (usa datos oficiales REE)
-BASE_URL = "https://api.preciodelaluz.org/v1/prices"
+# Indicadores ESIOS: 1001 (PCB), 1002 (Ceuta/Melilla)
+ESIOS_BASE = "https://api.esios.ree.es/indicators"
+INDICATOR_PCB = 1001
+INDICATOR_CM = 1002
 
-async def fetch_pvpc_data(zone: str = "PCB") -> Dict:
-    """Obtiene datos reales de PVPC desde API gratuita"""
+def fetch_esios_pvpc(day: date, zone: str) -> Dict:
+    """Obtiene precios PVPC de ESIOS REE para un día y zona"""
+    indicator = INDICATOR_PCB if zone.lower() == "pcb" else INDICATOR_CM
+    
+    start_date = day.strftime("%Y-%m-%dT00:00:00")
+    end_date = (day + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
+    
+    url = f"{ESIOS_BASE}/{indicator}"
+    params = {
+        "start_date": start_date,
+        "end_date": end_date
+    }
+    
     try:
-        url = f"{BASE_URL}/now?zone={zone}"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return response.json()
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=503, detail=f"Error obteniendo datos REE: {str(e)}")
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        hourly = {}
+        for entry in data.get("indicator", {}).get("values", []):
+            dt = datetime.fromisoformat(entry["datetime"].replace("Z", "+00:00"))
+            hour = dt.hour
+            price_mwh = float(entry["value"])
+            price_kwh = round(price_mwh / 1000, 5)
+            hourly[hour] = price_kwh
+        
+        if not hourly:
+            raise HTTPException(503, detail="No hay datos PVPC disponibles para este día")
+        
+        return {
+            "date": day,
+            "zone": zone.upper(),
+            "hourly": hourly
+        }
+    
+    except requests.RequestException as e:
+        raise HTTPException(503, detail=f"Error conectando con ESIOS: {str(e)}")
 
-def calculate_statistics(prices: List[float]) -> Dict:
-    """Calcula estadísticas de precios"""
+def calculate_stats(prices: List[float]) -> Dict:
+    """Calcula estadísticas de lista de precios"""
     if not prices:
         return {"min": 0, "max": 0, "avg": 0}
     return {
-        "min": round(min(prices), 4),
-        "max": round(max(prices), 4),
-        "avg": round(mean(prices), 4)
+        "min": round(min(prices), 5),
+        "max": round(max(prices), 5),
+        "avg": round(mean(prices), 5)
     }
 
 @app.get("/")
@@ -93,62 +122,50 @@ def get_current_price(zone: str = "pcb"):
     }
 
 @app.get("/today")
-async def get_today_prices(zone: str = "PCB"):
+def get_today_prices(zone: str = "pcb"):
     """Obtiene todos los precios del día de hoy"""
-    try:
-        url = f"https://api.preciodelaluz.org/v1/prices/all?zone={zone}"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            data = response.json()
-        
-        # Extraer precios por hora
-        hourly_prices = []
-        for hour, info in data.items():
-            if hour not in ["date", "units"]:
-                try:
-                    hourly_prices.append({
-                        "hour": hour,
-                        "price": float(info.get("price", 0)) / 1000,  # Convertir a €/kWh
-                        "is_cheap": info.get("is-cheap", False),
-                        "is_under_avg": info.get("is-under-avg", False)
-                    })
-                except (ValueError, TypeError):
-                    continue
-        
-        prices = [h["price"] for h in hourly_prices]
-        stats = calculate_statistics(prices)
-        
-        return {
-            "date": data.get("date", datetime.now().strftime("%Y-%m-%d")),
-            "zone": zone,
-            "hourly_prices": sorted(hourly_prices, key=lambda x: x["hour"]),
-            "statistics": stats,
-            "total_hours": len(hourly_prices),
-            "source": "REE oficial"
+    today = date.today()
+    data = fetch_esios_pvpc(today, zone)
+    
+    hourly = data["hourly"]
+    prices = list(hourly.values())
+    stats = calculate_stats(prices)
+    
+    hourly_list = [
+        {
+            "hour": f"{h:02d}:00-{(h+1)%24:02d}:00",
+            "price": hourly[h]
         }
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Error: {str(e)}")
+        for h in sorted(hourly.keys())
+    ]
+    
+    return {
+        "date": data["date"].isoformat(),
+        "zone": data["zone"],
+        "hourly_prices": hourly_list,
+        "statistics": stats,
+        "total_hours": len(hourly_list),
+        "source": "ESIOS REE directo"
+    }
 
 @app.get("/forecast")
-async def get_forecast(zone: str = "PCB"):
+def get_forecast(zone: str = "pcb"):
     """Predicción simple próximas 6 horas basada en media móvil"""
-    today_data = await get_today_prices(zone)
+    today_data = get_today_prices(zone)
     prices = [h["price"] for h in today_data["hourly_prices"]]
     
     current_hour = datetime.now().hour
     
-    # Predicción naive: promedio últimas 6 horas
     if len(prices) >= 6:
-        recent_avg = round(mean(prices[-6:]), 4)
+        recent_avg = round(mean(prices[-6:]), 5)
     else:
-        recent_avg = round(mean(prices), 4)
+        recent_avg = round(mean(prices), 5)
     
     forecast = []
     for i in range(1, 7):
         forecast_hour = (current_hour + i) % 24
         forecast.append({
-            "hour": f"{forecast_hour:02d}:00-{forecast_hour+1:02d}:00",
+            "hour": f"{forecast_hour:02d}:00-{(forecast_hour+1)%24:02d}:00",
             "predicted_price": recent_avg,
             "confidence": "low",
             "note": "Predicción basada en media móvil 6h"
