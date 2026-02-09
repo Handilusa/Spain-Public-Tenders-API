@@ -1,15 +1,15 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
+import requests
 import uvicorn
-from datetime import datetime
-from typing import Dict, List, Optional
+from datetime import datetime, date, timedelta
 from statistics import mean
+from typing import Dict, List
 
 app = FastAPI(
-    title="⚡ Spain Energy PVPC API PRO",
-    description="API real de precios PVPC España con datos actualizados de REE",
-    version="3.0.0"
+    title="⚡ Spain Energy PVPC API (ESIOS Direct)",
+    description="API real de precios PVPC España directamente de ESIOS REE",
+    version="4.0.0"
 )
 
 app.add_middleware(
@@ -47,36 +47,49 @@ def calculate_statistics(prices: List[float]) -> Dict:
 def root():
     """Endpoint raíz con información de la API"""
     return {
-        "api": "⚡ Spain Energy PVPC API PRO",
-        "version": "3.0.0",
+        "api": "⚡ Spain Energy PVPC API (ESIOS Direct)",
+        "version": "4.0.0",
         "status": "✅ LIVE",
-        "data_source": "REE oficial vía preciodelaluz.org",
+        "data_source": "ESIOS REE directo (sin intermediarios)",
         "endpoints": [
-            "/now - Precio actual PVPC",
-            "/today - Precios completos hoy",
-            "/forecast - Predicción próximas 6h",
-            "/stats - Estadísticas diarias",
-            "/cheapest - 5 horas más baratas hoy"
+            "/now?zone=pcb - Precio actual",
+            "/today?zone=pcb - Precios 24h hoy",
+            "/forecast?zone=pcb - Predicción 6h",
+            "/stats?zone=pcb - Estadísticas día",
+            "/cheapest?zone=pcb&limit=5 - Horas baratas"
         ],
-        "zones": ["PCB (Península/Canarias/Baleares)", "CYM (Ceuta y Melilla)"],
+        "zones": ["pcb (Península/Canarias/Baleares)", "cm (Ceuta/Melilla)"],
         "docs": "/docs"
     }
 
 @app.get("/now")
-async def get_current_price(zone: str = "PCB"):
-    """Obtiene el precio actual de la luz en tiempo real"""
-    data = await fetch_pvpc_data(zone)
+def get_current_price(zone: str = "pcb"):
+    """Precio actual de la luz en tiempo real"""
+    today = date.today()
+    data = fetch_esios_pvpc(today, zone)
+    
+    current_hour = datetime.now().hour
+    hourly = data["hourly"]
+    
+    if current_hour not in hourly:
+        raise HTTPException(404, detail=f"No hay precio para hora {current_hour}")
+    
+    current_price = hourly[current_hour]
+    prices = list(hourly.values())
+    stats = calculate_stats(prices)
     
     return {
         "timestamp": datetime.now().isoformat(),
-        "zone": zone,
-        "current_price_kwh": data.get("price", "N/A"),
+        "date": data["date"].isoformat(),
+        "zone": data["zone"],
+        "hour": f"{current_hour:02d}:00-{(current_hour+1)%24:02d}:00",
+        "price_kwh": current_price,
         "unit": "€/kWh",
-        "hour": data.get("hour", "N/A"),
-        "is_cheap": data.get("is-cheap", False),
-        "is_under_avg": data.get("is-under-avg", False),
-        "market": data.get("market", "N/A"),
-        "source": "REE oficial"
+        "is_cheap": current_price <= stats["avg"],
+        "is_lowest": current_price == stats["min"],
+        "is_highest": current_price == stats["max"],
+        "avg_day": stats["avg"],
+        "source": "ESIOS REE directo"
     }
 
 @app.get("/today")
@@ -150,44 +163,39 @@ async def get_forecast(zone: str = "PCB"):
     }
 
 @app.get("/stats")
-async def get_statistics(zone: str = "PCB"):
-    """Estadísticas completas del día"""
-    today = await get_today_prices(zone)
+def get_statistics(zone: str = "pcb"):
+    """Estadísticas completas del día actual"""
+    today_data = get_today_prices(zone)
     
-    hourly = today["hourly_prices"]
-    prices = [h["price"] for h in hourly]
+    hourly = today_data["hourly_prices"]
+    sorted_hours = sorted(hourly, key=lambda x: x["price"])
     
-    cheap_hours = [h for h in hourly if h["is_cheap"]]
-    expensive_hours = sorted(hourly, key=lambda x: x["price"], reverse=True)[:5]
+    cheapest_5 = sorted_hours[:5]
+    expensive_5 = sorted_hours[-5:][::-1]
     
     return {
-        "date": today["date"],
-        "zone": zone,
-        "statistics": today["statistics"],
-        "cheap_hours_count": len(cheap_hours),
-        "top_5_expensive": expensive_hours,
-        "recommendation": "Consume entre 00h-08h para ahorrar" if cheap_hours else "Precios elevados hoy",
-        "avg_price_comparison": {
-            "today": today["statistics"]["avg"],
-            "threshold_cheap": 0.10,
-            "threshold_expensive": 0.15
-        }
+        "date": today_data["date"],
+        "zone": today_data["zone"],
+        "statistics": today_data["statistics"],
+        "cheapest_hours": cheapest_5,
+        "most_expensive_hours": expensive_5,
+        "recommendation": "Programa consumos en horas baratas"
     }
 
 @app.get("/cheapest")
-async def get_cheapest_hours(zone: str = "PCB", limit: int = 5):
-    """Obtiene las N horas más baratas del día"""
-    today = await get_today_prices(zone)
+def get_cheapest_hours(zone: str = "pcb", limit: int = 5):
+    """N horas más baratas del día para programar consumos"""
+    if limit < 1 or limit > 24:
+        raise HTTPException(400, detail="limit debe estar entre 1 y 24")
     
-    sorted_hours = sorted(today["hourly_prices"], key=lambda x: x["price"])
-    cheapest = sorted_hours[:limit]
+    today_data = get_today_prices(zone)
+    sorted_hours = sorted(today_data["hourly_prices"], key=lambda x: x["price"])
     
     return {
-        "date": today["date"],
-        "zone": zone,
-        "cheapest_hours": cheapest,
-        "recommendation": f"Programa consumos intensivos en: {', '.join([h['hour'] for h in cheapest])}",
-        "potential_savings": f"{round((today['statistics']['max'] - today['statistics']['min']) * 100, 2)}% vs hora más cara"
+        "date": today_data["date"],
+        "zone": today_data["zone"],
+        "cheapest_hours": sorted_hours[:limit],
+        "avg_price_day": today_data["statistics"]["avg"]
     }
 
 if __name__ == "__main__":
